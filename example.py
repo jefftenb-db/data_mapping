@@ -8,5 +8,5 @@ WITH cte1 AS ( SELECT [BILL_NUM], [BILL_ITEM], FISCVARNT, CALMONTH, COUNT(*) AS 
 
 mapping_path = "conversion_file.xlsx"
 
-mapped = map_sql(sql, mapping_path, filter_by_sql=False)
+mapped = map_sql(sql, mapping_path, filter_by_sql=True)
 print(mapped)

@@ -4,6 +4,9 @@ Synapse to Databricks SQL mapping.
 Maps schema/table/column names in source SQL to target catalog/schema/table/column
 using a mapping table (e.g. from Excel). Handles [schema].[table] and schema.table
 references and qualified/unqualified column names.
+
+Raises MappingError when SOURCE_COLUMN_NAME and TARGET_COLUMN_NAME have different
+numbers of comma-separated values (1:1 mapping required).
 """
 
 from __future__ import annotations
@@ -80,32 +83,34 @@ def _build_table_map(df: pd.DataFrame) -> dict[str, tuple[str, str, str]]:
     return out
 
 
+class MappingError(Exception):
+    """Raised when column mapping is invalid (e.g. source and target lengths differ)."""
+
+
 def _build_column_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
     """
     Build (source_table_lower, source_column) -> target_column.
     Handles comma-separated SOURCE_COLUMN_NAME and TARGET_COLUMN_NAME (positional).
-    When lengths differ, extra source columns map to the last target column.
+    Requires 1:1 mapping: len(source columns) must equal len(target columns); raises MappingError otherwise.
     """
     out: dict[tuple[str, str], str] = {}
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         table_key = str(row[SOURCE_TABLE]).strip().lower()
         src_cols = [s.strip() for s in str(row[SOURCE_COLUMN]).split(",") if s.strip()]
         tgt_cols = [s.strip() for s in str(row[TARGET_COLUMN]).split(",") if s.strip()]
         if not src_cols or not tgt_cols:
             continue
-        if len(src_cols) >= 1 and len(tgt_cols) >= 1:
-            # Positional: src_cols[i] -> tgt_cols[min(i, len(tgt_cols)-1)]
-            for i, sc in enumerate(src_cols):
-                if not sc:
-                    continue
-                tc = tgt_cols[min(i, len(tgt_cols) - 1)]
-                if tc:
-                    out[(table_key, sc.lower())] = tc
-        else:
-            src_one = str(row[SOURCE_COLUMN]).strip()
-            tgt_one = str(row[TARGET_COLUMN]).strip()
-            if src_one and tgt_one:
-                out[(table_key, src_one.lower())] = tgt_one
+        if len(src_cols) != len(tgt_cols):
+            raise MappingError(
+                f"Column mapping must be 1:1. Row (table={row[SOURCE_TABLE]!r}): "
+                f"SOURCE_COLUMN_NAME has {len(src_cols)} value(s) {src_cols!r}, "
+                f"TARGET_COLUMN_NAME has {len(tgt_cols)} value(s) {tgt_cols!r}. "
+                "Use the same number of comma-separated source and target columns."
+            )
+        for i in range(len(src_cols)):
+            sc, tc = src_cols[i].strip(), tgt_cols[i].strip()
+            if sc and tc:
+                out[(table_key, sc.lower())] = tc
     return out
 
 

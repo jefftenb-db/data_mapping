@@ -26,6 +26,8 @@ The mapping Excel (e.g. `.xlsx`) should have at least these columns:
 
 There is no source catalog column; target always uses `catalog.schema.table`.
 
+**Column mapping must be 1:1:** when `SOURCE_COLUMN_NAME` or `TARGET_COLUMN_NAME` contains comma-separated values, the number of source and target columns must match. Otherwise `map_sql` raises `MappingError`.
+
 ## Usage
 
 ### Map SQL using an Excel file
@@ -84,6 +86,6 @@ mapped_sql = map_sql_from_source_details(
 - **String literals**  
   - Content inside single-quoted strings is not changed (e.g. `'BILL_NUM || BILL_ITEM' AS PRIMARY_KEY_NAME` stays as-is).
 - **Comma-separated columns**  
-  - If `SOURCE_COLUMN_NAME` or `TARGET_COLUMN_NAME` is comma-separated, mapping is positional (and extra source columns map to the last target column).
+  - If `SOURCE_COLUMN_NAME` or `TARGET_COLUMN_NAME` is comma-separated, the counts must match (1:1). Otherwise `MappingError` is raised.
 
 Complex SQL with CTEs and multiple joins is supported; table and column names are replaced wherever they appear, with string literals protected.

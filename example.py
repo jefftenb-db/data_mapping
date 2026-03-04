@@ -1,12 +1,18 @@
-from sql_mapper import map_sql, load_mapping
+from sql_mapper import map_sql, load_mapping, process_input_file #, main
 
-#sql = "SELECT LIFN2 FROM [raw_abdc_finance].[sapecc_wyt3]"
+# Option 1: Batch process using input file + mapping file (produces CSV + .sql)
+# Uses mapping_input_sql.xlsx and mapping_master.xlsx by default:
+# main()
+# Or with custom paths:
+process_input_file(
+    "mapping_input_sql.xlsx", #input file with sql statements and mapping id and dq test id
+    "mapping_master.xlsx", #mapping file with source and target names
+    "mapped_output.csv", #output file with mapped sql statements and mapping id and dq test id
+    "transpiler_input/mapped_output.sql", #output file with mapped sql statements, to be used in transpiler
+)
 
-sql = """
-WITH cte1 AS ( SELECT [BILL_NUM], [BILL_ITEM], FISCVARNT, CALMONTH, COUNT(*) AS duplicate_count FROM raw_abdc_operations.sapbw_billingtransactionlvl1 WHERE zzrefinv != '' AND bill_type IN ('zrk1', 'zrk2') AND ZPRICEOWN IN ('10', '20', '30', '40') AND salesorg IN ('1000', '2000', '1200') AND CAST(CREATED AS DATE) BETWEEN DATEADD(day, -180, GETDATE()) AND GETDATE() GROUP BY [BILL_NUM], [BILL_ITEM], FISCVARNT, CALMONTH ) SELECT 'BILL_NUM || BILL_ITEM || FISCVARNT || CALMONTH' AS PRIMARY_KEY_NAME, CAST(BILL_NUM AS VARCHAR) + ' || ' + CAST(BILL_ITEM AS VARCHAR) + ' || ' + CAST(FISCVARNT AS VARCHAR) + ' || ' + CAST(CALMONTH AS VARCHAR) AS PRIMARY_KEY_VALUE, 'BILL_NUM || BILL_ITEM || FISCVARNT || CALMONTH' AS ATTRIBUTE_NAME, CAST(BILL_NUM AS VARCHAR) + ' || ' + CAST(BILL_ITEM AS VARCHAR) + ' || ' + CAST(FISCVARNT AS VARCHAR) + ' || ' + CAST(CALMONTH AS VARCHAR) AS ATTRIBUTE_VALUE, 'duplicate_count' AS ADDITIONAL_COLUMN_NAME, duplicate_count AS ADDITIONAL_COLUMN_VALUE FROM cte1
-"""
-
-mapping_path = "conversion_file.xlsx"
-
-mapped = map_sql(sql, mapping_path, filter_by_sql=True)
-print(mapped)
+# Option 2: Map a single SQL statement with mapping file
+# mapping_path = "mapping_master.xlsx"
+# sql = "SELECT col FROM [schema].[table]"
+# mapped = map_sql(sql, mapping_path)
+# print(mapped)

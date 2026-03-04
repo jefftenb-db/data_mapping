@@ -5,7 +5,7 @@ Maps schema/table/column names in source SQL to target catalog/schema/table/colu
 using a mapping table (e.g. from Excel). Handles [schema].[table] and schema.table
 references and qualified/unqualified column names.
 
-Raises MappingError when SOURCE_COLUMN_NAME and TARGET_COLUMN_NAME have different
+Raises MappingError when SOURCE_COLUMN and TARGET_COLUMN have different
 numbers of comma-separated values (1:1 mapping required).
 """
 
@@ -18,22 +18,27 @@ from typing import Any
 import pandas as pd
 
 
-# Default Excel sheet name if not provided
-DEFAULT_SHEET = "result"
+# Default Excel sheet: 0 = first sheet (works with any workbook)
+DEFAULT_SHEET = 0
 
-# Columns expected in mapping
-SOURCE_TABLE = "SOURCE_TABLE_NAME"
-SOURCE_COLUMN = "SOURCE_COLUMN_NAME"
-TARGET_CATALOG = "TARGET_CATALOG_NAME"
-TARGET_SCHEMA = "TARGET_SCHEMA_NAME"
-TARGET_TABLE = "TARGET_TABLE_NAME"
-TARGET_COLUMN = "TARGET_COLUMN_NAME"
-SOURCE_SQL = "SOURCE_SQL_STATEMENT"
+# Columns expected in mapping file
+SOURCE_SCHEMA = "SOURCE_SCHEMA"
+SOURCE_TABLE = "SOURCE_TABLE"
+SOURCE_COLUMN = "SOURCE_COLUMN"
+TARGET_CATALOG = "TARGET_CATALOG"
+TARGET_SCHEMA = "TARGET_SCHEMA"
+TARGET_TABLE = "TARGET_TABLE"
+TARGET_COLUMN = "TARGET_COLUMN"
+
+# Columns expected in input SQL file
+INPUT_MAPPING_ID = "MAPPING_ID"
+INPUT_DQ_TEST_ID = "DQ_TEST_ID"
+INPUT_SQL = "PRIMARY_SQL_QUERY"
 
 
 def load_mapping(
     source: str | Path | pd.DataFrame,
-    sheet_name: str = DEFAULT_SHEET,
+    sheet_name: str | int = DEFAULT_SHEET,
 ) -> pd.DataFrame:
     """
     Load mapping from Excel file or return DataFrame as-is.
@@ -43,20 +48,52 @@ def load_mapping(
         sheet_name: Sheet name when source is an Excel path. Ignored if source is DataFrame.
 
     Returns:
-        DataFrame with columns SOURCE_TABLE_NAME, SOURCE_COLUMN_NAME,
-        TARGET_CATALOG_NAME, TARGET_SCHEMA_NAME, TARGET_TABLE_NAME, TARGET_COLUMN_NAME,
-        and optionally SOURCE_SQL_STATEMENT.
+        DataFrame with columns SOURCE_SCHEMA, SOURCE_TABLE, SOURCE_COLUMN,
+        TARGET_CATALOG, TARGET_SCHEMA, TARGET_TABLE, TARGET_COLUMN.
     """
     if isinstance(source, pd.DataFrame):
         return source.copy()
     path = Path(source)
-    if not path.suffix.lower() in (".xlsx", ".xls"):
+    if path.suffix.lower() not in (".xlsx", ".xls"):
         raise ValueError("Excel source must be .xlsx or .xls")
     df = pd.read_excel(path, sheet_name=sheet_name)
-    required = [SOURCE_TABLE, SOURCE_COLUMN, TARGET_CATALOG, TARGET_SCHEMA, TARGET_TABLE, TARGET_COLUMN]
+    required = [
+        SOURCE_SCHEMA,
+        SOURCE_TABLE,
+        SOURCE_COLUMN,
+        TARGET_CATALOG,
+        TARGET_SCHEMA,
+        TARGET_TABLE,
+        TARGET_COLUMN,
+    ]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Mapping missing columns: {missing}")
+    return df
+
+
+def load_input_sql(
+    source: str | Path,
+    sheet_name: str | int = DEFAULT_SHEET,
+) -> pd.DataFrame:
+    """
+    Load input file with one SQL statement per row.
+
+    Args:
+        source: Path to Excel file (.xlsx or .xls).
+        sheet_name: Sheet name to read.
+
+    Returns:
+        DataFrame with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY.
+    """
+    path = Path(source)
+    if path.suffix.lower() not in (".xlsx", ".xls"):
+        raise ValueError("Input SQL source must be .xlsx or .xls")
+    df = pd.read_excel(path, sheet_name=sheet_name)
+    required = [INPUT_MAPPING_ID, INPUT_DQ_TEST_ID, INPUT_SQL]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Input SQL file missing columns: {missing}")
     return df
 
 
@@ -90,7 +127,7 @@ class MappingError(Exception):
 def _build_column_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
     """
     Build (source_table_lower, source_column) -> target_column.
-    Handles comma-separated SOURCE_COLUMN_NAME and TARGET_COLUMN_NAME (positional).
+    Handles comma-separated SOURCE_COLUMN and TARGET_COLUMN (positional).
     Requires 1:1 mapping: len(source columns) must equal len(target columns); raises MappingError otherwise.
     """
     out: dict[tuple[str, str], str] = {}
@@ -103,8 +140,8 @@ def _build_column_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
         if len(src_cols) != len(tgt_cols):
             raise MappingError(
                 f"Column mapping must be 1:1. Row (table={row[SOURCE_TABLE]!r}): "
-                f"SOURCE_COLUMN_NAME has {len(src_cols)} value(s) {src_cols!r}, "
-                f"TARGET_COLUMN_NAME has {len(tgt_cols)} value(s) {tgt_cols!r}. "
+                f"SOURCE_COLUMN has {len(src_cols)} value(s) {src_cols!r}, "
+                f"TARGET_COLUMN has {len(tgt_cols)} value(s) {tgt_cols!r}. "
                 "Use the same number of comma-separated source and target columns."
             )
         for i in range(len(src_cols)):
@@ -250,8 +287,7 @@ def map_sql(
     sql: str,
     mapping: str | Path | pd.DataFrame,
     *,
-    sheet_name: str = DEFAULT_SHEET,
-    filter_by_sql: bool = True,
+    sheet_name: str | int = DEFAULT_SHEET,
 ) -> str:
     """
     Map a source (Synapse) SQL statement to target (Databricks) using the mapping.
@@ -265,22 +301,11 @@ def map_sql(
         sql: The source SQL statement to convert.
         mapping: Path to Excel file or a DataFrame with mapping columns.
         sheet_name: Sheet name when mapping is an Excel path.
-        filter_by_sql: If True and mapping has SOURCE_SQL_STATEMENT, only use rows
-            where SOURCE_SQL_STATEMENT matches the given sql (after normalizing whitespace).
-            If False, use all rows in the mapping.
 
     Returns:
         The SQL string with table and column names replaced.
     """
     df = load_mapping(mapping, sheet_name=sheet_name)
-
-    if filter_by_sql and SOURCE_SQL in df.columns:
-        normalized = _normalize_sql(sql)
-        if normalized:
-            has_sql = df[SOURCE_SQL].notna() & (df[SOURCE_SQL].astype(str).str.strip() != "")
-            mask = has_sql & (df[SOURCE_SQL].astype(str).apply(_normalize_sql) == normalized)
-            if mask.any():
-                df = df.loc[mask].copy()
 
     table_map = _build_table_map(df)
     column_map = _build_column_map(df)
@@ -322,6 +347,7 @@ def map_sql_from_source_details(
     df = pd.DataFrame(
         [
             {
+                SOURCE_SCHEMA: "",  # optional for single-row convenience
                 SOURCE_TABLE: source_table_name,
                 SOURCE_COLUMN: source_column_name,
                 TARGET_CATALOG: target_catalog_name,
@@ -331,4 +357,81 @@ def map_sql_from_source_details(
             }
         ]
     )
-    return map_sql(sql, df, filter_by_sql=False)
+    return map_sql(sql, df)
+
+
+def process_input_file(
+    input_path: str | Path,
+    mapping_path: str | Path,
+    output_csv_path: str | Path,
+    output_sql_path: str | Path,
+    *,
+    input_sheet: str | int = DEFAULT_SHEET,
+    mapping_sheet: str | int = DEFAULT_SHEET,
+) -> None:
+    """
+    Load SQL statements from the input file, map each using the mapping file,
+    and write two outputs: a CSV (IDs + mapped SQL) and a .sql file (statements only, semicolon-terminated).
+
+    Args:
+        input_path: Path to Excel file with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY.
+        mapping_path: Path to Excel mapping file with SOURCE_* and TARGET_* columns.
+        output_csv_path: Path for CSV output (MAPPING_ID, DQ_TEST_ID, MAPPED_SQL).
+        output_sql_path: Path for .sql output (one statement per block, each ending with ;).
+        input_sheet: Sheet name in input file.
+        mapping_sheet: Sheet name in mapping file.
+    """
+    input_df = load_input_sql(input_path, sheet_name=input_sheet)
+    mapping_df = load_mapping(mapping_path, sheet_name=mapping_sheet)
+
+    rows = []
+    sql_statements = []
+    for _, row in input_df.iterrows():
+        mapping_id = row[INPUT_MAPPING_ID]
+        dq_test_id = row[INPUT_DQ_TEST_ID]
+        sql = row[INPUT_SQL]
+        if pd.isna(sql) or str(sql).strip() == "":
+            mapped = ""
+        else:
+            mapped = map_sql(str(sql).strip(), mapping_df, sheet_name=mapping_sheet)
+        rows.append(
+            {
+                INPUT_MAPPING_ID: mapping_id,
+                INPUT_DQ_TEST_ID: dq_test_id,
+                "MAPPED_SQL": mapped,
+            }
+        )
+        # Ensure statement ends with semicolon for .sql file
+        stmt = mapped.rstrip()
+        if stmt and not stmt.endswith(";"):
+            stmt += ";"
+        sql_statements.append(stmt)
+
+    out_csv = Path(output_csv_path)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+    out_sql = Path(output_sql_path)
+    out_sql.parent.mkdir(parents=True, exist_ok=True)
+    out_sql.write_text("\n\n".join(sql_statements), encoding="utf-8")
+
+
+# # Default file names for batch run
+# DEFAULT_INPUT_SQL_FILE = "mapping_input_sql.xlsx"
+# DEFAULT_MAPPING_FILE = "mapping_master.xlsx"
+# DEFAULT_OUTPUT_CSV = "mapped_output.csv"
+# DEFAULT_OUTPUT_SQL = "mapped_output.sql"
+
+
+# def main(
+#     input_path: str | Path = DEFAULT_INPUT_SQL_FILE,
+#     mapping_path: str | Path = DEFAULT_MAPPING_FILE,
+#     output_csv: str | Path = DEFAULT_OUTPUT_CSV,
+#     output_sql: str | Path = DEFAULT_OUTPUT_SQL,
+# ) -> None:
+#     """Run batch mapping: input SQL file + mapping file -> CSV and .sql outputs."""
+#     process_input_file(input_path, mapping_path, output_csv, output_sql)
+
+
+# if __name__ == "__main__":
+#     main()

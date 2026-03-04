@@ -1,6 +1,6 @@
 # Synapse to Databricks SQL mapping
 
-Map schema, table, and column names in Synapse SQL to Databricks three-level names (catalog.schema.table) and target column names using an Excel mapping file.
+Map schema, table, and column names in Synapse SQL to Databricks three-level names (catalog.schema.table) and target column names using Excel mapping and input files.
 
 ## Setup
 
@@ -10,55 +10,70 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Excel mapping format
+## File formats
 
-The mapping Excel (e.g. `.xlsx`) should have at least these columns:
+### Input SQL file (`mapping_input_sql.xlsx`)
 
-| Column                 | Description                    |
-|------------------------|--------------------------------|
-| SOURCE_TABLE_NAME      | Source table name (e.g. SAPECC_WYT3) |
-| SOURCE_COLUMN_NAME     | Source column name(s); comma-separated for multi-column mapping |
-| TARGET_CATALOG_NAME    | Databricks catalog             |
-| TARGET_SCHEMA_NAME     | Databricks schema              |
-| TARGET_TABLE_NAME      | Databricks table               |
-| TARGET_COLUMN_NAME     | Target column name(s); comma-separated, positional with source |
-| SOURCE_SQL_STATEMENT   | (Optional) If present, `map_sql(..., filter_by_sql=True)` uses only rows whose SOURCE_SQL_STATEMENT matches the input SQL |
+One SQL statement per row. Required columns:
 
-There is no source catalog column; target always uses `catalog.schema.table`.
+| Column            | Description                    |
+|-------------------|--------------------------------|
+| MAPPING_ID        | ID for audit (included in CSV output) |
+| DQ_TEST_ID        | ID for audit (included in CSV output) |
+| PRIMARY_SQL_QUERY | Source SQL statement to map   |
 
-**Column mapping must be 1:1:** when `SOURCE_COLUMN_NAME` or `TARGET_COLUMN_NAME` contains comma-separated values, the number of source and target columns must match. Otherwise `map_sql` raises `MappingError`.
+### Mapping file (`mapping_master.xlsx`)
+
+Source → target name lookup. Required columns:
+
+| Column         | Description                    |
+|----------------|--------------------------------|
+| SOURCE_SCHEMA  | Source schema                  |
+| SOURCE_TABLE   | Source table name              |
+| SOURCE_COLUMN  | Source column name(s); comma-separated for multi-column mapping |
+| TARGET_CATALOG | Databricks catalog             |
+| TARGET_SCHEMA  | Databricks schema              |
+| TARGET_TABLE   | Databricks table               |
+| TARGET_COLUMN  | Target column name(s); comma-separated, positional with source  |
+
+**Column mapping must be 1:1:** when `SOURCE_COLUMN` or `TARGET_COLUMN` contains comma-separated values, the number of source and target columns must match. Otherwise `MappingError` is raised.
 
 ## Usage
 
-### Map SQL using an Excel file
+### Batch run (input file → CSV + .sql)
 
-```python
-from sql_mapper import map_sql, load_mapping
+From the project directory, with `mapping_input_sql.xlsx` and `mapping_master.xlsx` in place:
 
-# Input: source SQL and path to your conversion Excel
-sql = "SELECT LIFN2 FROM [raw_abdc_finance].[sapecc_wyt3]"
-mapping_path = "/path/to/conversion_file.xlsx"
-
-# Use only mapping rows that have this exact SQL (if SOURCE_SQL_STATEMENT exists)
-mapped_sql = map_sql(sql, mapping_path, filter_by_sql=True)
-# → SELECT other_vend_ref FROM adh_genpro_use2_prd.s_suppliers.partner_functions_hhd
-
-# Use all mapping rows (for any SQL that uses the same table/column names)
-mapped_sql = map_sql(sql, mapping_path, filter_by_sql=False)
+```bash
+python -m sql_mapper
 ```
 
-### Map SQL using a DataFrame
+This produces:
+
+- **mapped_output.csv** — columns `MAPPING_ID`, `DQ_TEST_ID`, `MAPPED_SQL` (for audit).
+- **mapped_output.sql** — one mapped statement per block, each terminated with a semicolon.
+
+Custom paths:
 
 ```python
-import pandas as pd
+from sql_mapper import process_input_file
+
+process_input_file(
+    "mapping_input_sql.xlsx",
+    "mapping_master.xlsx",
+    "mapped_output.csv",
+    "mapped_output.sql",
+)
+```
+
+### Map a single SQL statement
+
+```python
 from sql_mapper import map_sql, load_mapping
 
-df = load_mapping("/path/to/conversion_file.xlsx")
-# Or build your own DataFrame with columns:
-# SOURCE_TABLE_NAME, SOURCE_COLUMN_NAME, TARGET_CATALOG_NAME, TARGET_SCHEMA_NAME,
-# TARGET_TABLE_NAME, TARGET_COLUMN_NAME
-
-mapped_sql = map_sql(sql, df, filter_by_sql=False)
+sql = "SELECT LIFN2 FROM [raw_abdc_finance].[sapecc_wyt3]"
+mapping_path = "mapping_master.xlsx"
+mapped_sql = map_sql(sql, mapping_path)
 ```
 
 ### Map SQL with a single mapping row (no Excel)
@@ -67,7 +82,7 @@ mapped_sql = map_sql(sql, df, filter_by_sql=False)
 from sql_mapper import map_sql_from_source_details
 
 mapped_sql = map_sql_from_source_details(
-    sql="SELECT LIFN2 FROM [raw_abdc_finance].[sapecc_wyt3]",  # must reference the source column to map it
+    sql="SELECT LIFN2 FROM [raw_abdc_finance].[sapecc_wyt3]",
     source_table_name="SAPECC_WYT3",
     source_column_name="LIFN2",
     target_catalog_name="adh_genpro_use2_prd",
@@ -86,6 +101,6 @@ mapped_sql = map_sql_from_source_details(
 - **String literals**  
   - Content inside single-quoted strings is not changed (e.g. `'BILL_NUM || BILL_ITEM' AS PRIMARY_KEY_NAME` stays as-is).
 - **Comma-separated columns**  
-  - If `SOURCE_COLUMN_NAME` or `TARGET_COLUMN_NAME` is comma-separated, the counts must match (1:1). Otherwise `MappingError` is raised.
+  - If `SOURCE_COLUMN` or `TARGET_COLUMN` is comma-separated, the counts must match (1:1). Otherwise `MappingError` is raised.
 
 Complex SQL with CTEs and multiple joins is supported; table and column names are replaced wherever they appear, with string literals protected.

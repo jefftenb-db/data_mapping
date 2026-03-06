@@ -5,12 +5,16 @@ Maps schema/table/column names in source SQL to target catalog/schema/table/colu
 using a mapping table (e.g. from Excel). Handles [schema].[table] and schema.table
 references and qualified/unqualified column names.
 
+Optional SQL syntax conversion is driven by a JSON rules file (e.g. remove
+"(NOBLOCK)", WITH (NOLOCK), etc.) via load_syntax_rules() and apply_syntax_rules().
+
 Raises MappingError when SOURCE_COLUMN and TARGET_COLUMN have different
 numbers of comma-separated values (1:1 mapping required).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -34,6 +38,84 @@ TARGET_COLUMN = "TARGET_COLUMN"
 INPUT_MAPPING_ID = "MAPPING_ID"
 INPUT_DQ_TEST_ID = "DQ_TEST_ID"
 INPUT_SQL = "PRIMARY_SQL_QUERY"
+
+# Keys for syntax rules file (JSON)
+RULES_KEY = "rules"
+RULE_FIND = "find"
+RULE_REPLACE = "replace"
+RULE_REGEX = "regex"
+
+
+def load_syntax_rules(source: str | Path) -> list[dict[str, Any]]:
+    """
+    Load SQL syntax conversion rules from a JSON file.
+
+    File format: {"rules": [{"find": "(NOBLOCK)", "replace": ""}, ...]}
+    Add "regex": true to a rule to treat "find" as a regex pattern.
+
+    Args:
+        source: Path to .json file.
+
+    Returns:
+        List of rule dicts with keys "find", "replace", and optionally "regex".
+    """
+    path = Path(source)
+    if not path.exists():
+        raise FileNotFoundError(f"Syntax rules file not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix != ".json":
+        raise ValueError(f"Syntax rules file must be .json; got {path.suffix}")
+    text = path.read_text(encoding="utf-8")
+    data = json.loads(text)
+    if not isinstance(data, dict) or RULES_KEY not in data:
+        raise ValueError(
+            f"Syntax rules file must contain a top-level '{RULES_KEY}' key with a list of rules."
+        )
+    rules = data[RULES_KEY]
+    if not isinstance(rules, list):
+        raise ValueError(f"'{RULES_KEY}' must be a list of rule objects.")
+    out: list[dict[str, Any]] = []
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict) or RULE_FIND not in r or RULE_REPLACE not in r:
+            raise ValueError(
+                f"Each rule must be an object with '{RULE_FIND}' and '{RULE_REPLACE}'; "
+                f"rule at index {i} is invalid."
+            )
+        replace = r[RULE_REPLACE]
+        out.append(
+            {
+                RULE_FIND: r[RULE_FIND],
+                RULE_REPLACE: replace if isinstance(replace, str) else str(replace),
+                RULE_REGEX: bool(r.get(RULE_REGEX, False)),
+            }
+        )
+    return out
+
+
+def apply_syntax_rules(sql: str, rules: list[dict[str, Any]]) -> str:
+    """
+    Apply a list of syntax conversion rules to a SQL string.
+
+    Rules are applied in order. Each rule is either a literal find/replace
+    or a regex find/replace (when the rule has "regex": true).
+
+    Args:
+        sql: SQL string to transform.
+        rules: List of rule dicts from load_syntax_rules (find, replace, optional regex).
+
+    Returns:
+        SQL string after applying all rules.
+    """
+    result = sql
+    for r in rules:
+        find = r[RULE_FIND]
+        replace = r[RULE_REPLACE]
+        use_regex = r.get(RULE_REGEX, False)
+        if use_regex:
+            result = re.sub(find, replace, result)
+        else:
+            result = result.replace(find, replace)
+    return result
 
 
 def load_mapping(
@@ -368,21 +450,28 @@ def process_input_file(
     *,
     input_sheet: str | int = DEFAULT_SHEET,
     mapping_sheet: str | int = DEFAULT_SHEET,
+    syntax_rules_path: str | Path | None = None,
 ) -> None:
     """
     Load SQL statements from the input file, map each using the mapping file,
     and write two outputs: a CSV (IDs + mapped SQL) and a .sql file (statements only, semicolon-terminated).
 
+    Optionally applies syntax conversion rules from a JSON or YAML file (e.g. remove (NOBLOCK)).
+
     Args:
         input_path: Path to Excel file with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY.
         mapping_path: Path to Excel mapping file with SOURCE_* and TARGET_* columns.
         output_csv_path: Path for CSV output (MAPPING_ID, DQ_TEST_ID, MAPPED_SQL).
-        output_sql_path: Path for .sql output (one statement per block, each ending with ;).
+        output_sql_path: Path for .sql output (one statement per line, each prefixed with /* MAPPING_ID,DQ_TEST_ID */ and ending with ;).
         input_sheet: Sheet name in input file.
         mapping_sheet: Sheet name in mapping file.
+        syntax_rules_path: Optional path to JSON file defining find/replace syntax rules.
     """
     input_df = load_input_sql(input_path, sheet_name=input_sheet)
     mapping_df = load_mapping(mapping_path, sheet_name=mapping_sheet)
+    syntax_rules: list[dict[str, Any]] = []
+    if syntax_rules_path is not None:
+        syntax_rules = load_syntax_rules(syntax_rules_path)
 
     rows = []
     sql_statements = []
@@ -393,7 +482,12 @@ def process_input_file(
         if pd.isna(sql) or str(sql).strip() == "":
             mapped = ""
         else:
-            mapped = map_sql(str(sql).strip(), mapping_df, sheet_name=mapping_sheet)
+            # Normalize to single line (collapse tabs, carriage returns, newlines)
+            sql_normalized = _normalize_sql(sql)
+            mapped = map_sql(sql_normalized, mapping_df, sheet_name=mapping_sheet)
+            if syntax_rules:
+                mapped = apply_syntax_rules(mapped, syntax_rules)
+            mapped = _normalize_sql(mapped)
         rows.append(
             {
                 INPUT_MAPPING_ID: mapping_id,
@@ -401,11 +495,15 @@ def process_input_file(
                 "MAPPED_SQL": mapped,
             }
         )
-        # Ensure statement ends with semicolon for .sql file
+        # Ensure statement ends with semicolon for .sql file; prepend ID comment
         stmt = mapped.rstrip()
         if stmt and not stmt.endswith(";"):
             stmt += ";"
-        sql_statements.append(stmt)
+        id_comment = "/* {},{} */".format(
+            "" if pd.isna(mapping_id) else mapping_id,
+            "" if pd.isna(dq_test_id) else dq_test_id,
+        )
+        sql_statements.append(f"{id_comment} {stmt}")
 
     out_csv = Path(output_csv_path)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -413,7 +511,7 @@ def process_input_file(
 
     out_sql = Path(output_sql_path)
     out_sql.parent.mkdir(parents=True, exist_ok=True)
-    out_sql.write_text("\n\n".join(sql_statements), encoding="utf-8")
+    out_sql.write_text("\n".join(sql_statements), encoding="utf-8")
 
 
 # # Default file names for batch run

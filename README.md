@@ -38,6 +38,27 @@ Source → target name lookup. Required columns:
 
 **Column mapping must be 1:1:** when `SOURCE_COLUMN` or `TARGET_COLUMN` contains comma-separated values, the number of source and target columns must match. Otherwise `MappingError` is raised.
 
+### Syntax rules file (optional, JSON)
+
+Optional find/replace rules applied to SQL after mapping (e.g. remove Synapse hints, fix dialect differences). Copy `sql_syntax_rules.example.json` to `sql_syntax_rules.json` and edit.
+
+| Key       | Description |
+|-----------|--------------|
+| `find`    | String or regex pattern to find |
+| `replace` | Replacement (use `""` to remove) |
+| `regex`   | Optional; if `true`, `find` is a regex and `replace` may use `\1`, `\2` for capture groups |
+
+Example:
+
+```json
+{
+  "rules": [
+    { "find": "(NOBLOCK)", "replace": "" },
+    { "find": "TABLESAMPLE\\s*\\(\\s*(\\d+)\\s*PERCENTAGE\\s*\\)", "replace": "TABLESAMPLE (\\1 PERCENT)", "regex": true }
+  ]
+}
+```
+
 ## Usage
 
 ### Batch run (input file → CSV + .sql)
@@ -53,7 +74,7 @@ This produces:
 - **mapped_output.csv** — columns `MAPPING_ID`, `DQ_TEST_ID`, `MAPPED_SQL` (for audit).
 - **mapped_output.sql** — one mapped statement per block, each terminated with a semicolon.
 
-Custom paths:
+Custom paths (optionally with syntax rules):
 
 ```python
 from sql_mapper import process_input_file
@@ -63,7 +84,17 @@ process_input_file(
     "mapping_master.xlsx",
     "mapped_output.csv",
     "mapped_output.sql",
+    syntax_rules_path="sql_syntax_rules.json",  # optional
 )
+```
+
+### Apply syntax rules only (no mapping)
+
+```python
+from sql_mapper import load_syntax_rules, apply_syntax_rules
+
+rules = load_syntax_rules("sql_syntax_rules.json")
+cleaned_sql = apply_syntax_rules(sql, rules)
 ```
 
 ### Map a single SQL statement
@@ -100,6 +131,8 @@ mapped_sql = map_sql_from_source_details(
   - Qualified (`table.column` or `alias.column`) and unqualified column names are replaced when they match the mapping. Unqualified replacement is whole-word only.
 - **String literals**  
   - Content inside single-quoted strings is not changed (e.g. `'BILL_NUM || BILL_ITEM' AS PRIMARY_KEY_NAME` stays as-is).
+- **Syntax rules (optional)**  
+  - If `syntax_rules_path` is provided, rules are loaded from the JSON file and applied to each mapped SQL statement (after table/column mapping). Rules run in order; use `"regex": true` for regex patterns and `\1`, `\2` in `replace` for capture groups.
 - **Comma-separated columns**  
   - If `SOURCE_COLUMN` or `TARGET_COLUMN` is comma-separated, the counts must match (1:1). Otherwise `MappingError` is raised.
 

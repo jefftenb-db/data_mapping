@@ -9,6 +9,7 @@ process_input_file(
     "mapping_master.xlsx", #mapping file with source and target names
     "mapped_output.csv", #output file with mapped sql statements and mapping id and dq test id
     "transpiler_input/mapped_output.sql", #output file with mapped sql statements, to be used in transpiler
+    syntax_rules_path="sql_syntax_rules.json", #optional syntax rules file
 )
 
 # Option 2: Map a single SQL statement with mapping file

@@ -7,6 +7,7 @@ references and qualified/unqualified column names.
 
 Optional SQL syntax conversion is driven by a JSON rules file (e.g. remove
 "(NOBLOCK)", WITH (NOLOCK), etc.) via load_syntax_rules() and apply_syntax_rules().
+HTML entities (e.g. &gt;, &lt;, &amp;) in input SQL are decoded automatically before mapping.
 
 Raises MappingError when SOURCE_COLUMN and TARGET_COLUMN have different
 numbers of comma-separated values (1:1 mapping required).
@@ -14,6 +15,7 @@ numbers of comma-separated values (1:1 mapping required).
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from pathlib import Path
@@ -211,11 +213,13 @@ def _normalize_sql(sql: Any) -> str:
     return " ".join(s.split()) if s else ""
 
 
-def _build_table_map(df: pd.DataFrame) -> dict[str, tuple[str, str, str]]:
-    """Build source table (lower) -> (catalog, schema, table). First occurrence wins."""
-    out: dict[str, tuple[str, str, str]] = {}
-    for _, row in df.drop_duplicates(SOURCE_TABLE).iterrows():
-        key = str(row[SOURCE_TABLE]).strip().lower()
+def _build_table_map(df: pd.DataFrame) -> dict[tuple[str, str], tuple[str, str, str]]:
+    """Build (source_schema_lower, source_table_lower) -> (catalog, schema, table). First occurrence wins."""
+    out: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for _, row in df.drop_duplicates([SOURCE_SCHEMA, SOURCE_TABLE]).iterrows():
+        schema_key = str(row[SOURCE_SCHEMA]).strip().lower()
+        table_key = str(row[SOURCE_TABLE]).strip().lower()
+        key = (schema_key, table_key)
         if key in out:
             continue
         out[key] = (
@@ -230,30 +234,37 @@ class MappingError(Exception):
     """Raised when column mapping is invalid (e.g. source and target lengths differ)."""
 
 
-def _build_column_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
+def _build_column_map(df: pd.DataFrame) -> dict[tuple[str, str, str], str]:
     """
-    Build (source_table_lower, source_column) -> target_column.
+    Build (source_schema_lower, source_table_lower, source_column_lower) -> target_column.
     Handles comma-separated SOURCE_COLUMN and TARGET_COLUMN (positional).
     Requires 1:1 mapping: len(source columns) must equal len(target columns); raises MappingError otherwise.
+    Empty TARGET_COLUMN (or empty cell for one column) means leave that source column unchanged in the SQL.
     """
-    out: dict[tuple[str, str], str] = {}
+    out: dict[tuple[str, str, str], str] = {}
     for idx, row in df.iterrows():
+        schema_key = str(row[SOURCE_SCHEMA]).strip().lower()
         table_key = str(row[SOURCE_TABLE]).strip().lower()
-        src_cols = [s.strip() for s in str(row[SOURCE_COLUMN]).split(",") if s.strip()]
-        tgt_cols = [s.strip() for s in str(row[TARGET_COLUMN]).split(",") if s.strip()]
-        if not src_cols or not tgt_cols:
+        src_raw = row[SOURCE_COLUMN]
+        tgt_raw = row[TARGET_COLUMN]
+        src_str = "" if pd.isna(src_raw) else str(src_raw).strip()
+        tgt_str = "" if pd.isna(tgt_raw) else str(tgt_raw).strip()
+        src_cols = [s.strip() for s in src_str.split(",")]
+        tgt_cols = [s.strip() for s in tgt_str.split(",")]
+        if not src_cols:
             continue
         if len(src_cols) != len(tgt_cols):
             raise MappingError(
-                f"Column mapping must be 1:1. Row (table={row[SOURCE_TABLE]!r}): "
+                f"Column mapping must be 1:1. Row (schema={row[SOURCE_SCHEMA]!r}, table={row[SOURCE_TABLE]!r}): "
                 f"SOURCE_COLUMN has {len(src_cols)} value(s) {src_cols!r}, "
                 f"TARGET_COLUMN has {len(tgt_cols)} value(s) {tgt_cols!r}. "
-                "Use the same number of comma-separated source and target columns."
+                "Use the same number of comma-separated source and target columns "
+                "(use empty target to leave a source column unchanged)."
             )
         for i in range(len(src_cols)):
-            sc, tc = src_cols[i].strip(), tgt_cols[i].strip()
+            sc, tc = src_cols[i], tgt_cols[i]
             if sc and tc:
-                out[(table_key, sc.lower())] = tc
+                out[(schema_key, table_key, sc.lower())] = tc
     return out
 
 
@@ -293,73 +304,130 @@ def _unmask_string_literals(sql: str, literals: list[str]) -> str:
     return sql
 
 
-def _replace_table_refs(sql: str, table_map: dict[str, tuple[str, str, str]]) -> str:
+def _replace_table_refs(
+    sql: str, table_map: dict[tuple[str, str], tuple[str, str, str]]
+) -> str:
     """
     Replace Synapse-style table references with Databricks catalog.schema.table.
-    Handles [schema].[table] and schema.table (unquoted). Case-insensitive table match.
+    Lookup order: SOURCE_SCHEMA, then SOURCE_TABLE.
+    Handles: catalog.schema.table (3-part), schema.table (2-part), [schema].[table].
+    Case-insensitive match.
     """
     result = sql
 
-    # 1) Bracket notation: [schema].[table]
+    # 1) Bracket notation: [schema].[table] -> lookup (schema, table)
     def bracket_repl(m: re.Match) -> str:
-        schema_part, table_part = m.group(1), m.group(2)
-        table_lower = table_part.lower()
-        if table_lower in table_map:
-            cat, sch, tbl = table_map[table_lower]
+        schema_part = m.group(1).strip().lower()
+        table_part = m.group(2).strip().lower()
+        key = (schema_part, table_part)
+        if key in table_map:
+            cat, sch, tbl = table_map[key]
             return f"{cat}.{sch}.{tbl}"
         return m.group(0)
 
     result = re.sub(r"\[([^\]]+)\]\.\[([^\]]+)\]", bracket_repl, result, flags=re.IGNORECASE)
 
-    # 2) Dot notation: schema.table (word.word) - avoid matching number.number
-    def dot_repl(m: re.Match) -> str:
-        schema_part, table_part = m.group(1), m.group(2)
-        table_lower = table_part.lower()
-        if table_lower in table_map:
-            cat, sch, tbl = table_map[table_lower]
+    # 2) Three-part: catalog.schema.table -> lookup (schema, table)
+    def three_part_repl(m: re.Match) -> str:
+        schema_part = m.group(2).lower()
+        table_part = m.group(3).lower()
+        key = (schema_part, table_part)
+        if key in table_map:
+            cat, sch, tbl = table_map[key]
             return f"{cat}.{sch}.{tbl}"
         return m.group(0)
 
-    # Match identifier.identifier (identifiers: letters, digits, underscore; not starting with digit)
+    result = re.sub(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b",
+        three_part_repl,
+        result,
+    )
+
+    # 3) Two-part: schema.table -> lookup (schema, table)
+    def two_part_repl(m: re.Match) -> str:
+        schema_part, table_part = m.group(1).lower(), m.group(2).lower()
+        key = (schema_part, table_part)
+        if key in table_map:
+            cat, sch, tbl = table_map[key]
+            return f"{cat}.{sch}.{tbl}"
+        return m.group(0)
+
     result = re.sub(
         r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b",
-        dot_repl,
+        two_part_repl,
         result,
     )
 
     return result
 
 
+def _tables_in_sql(
+    sql: str, table_map: dict[tuple[str, str], tuple[str, str, str]]
+) -> set[tuple[str, str]]:
+    """
+    Return the set of (source_schema, source_table) pairs that appear as table refs
+    in sql and are present in table_map. Used to restrict unqualified column replacement
+    to only columns from tables that actually appear in the statement.
+    """
+    found: set[tuple[str, str]] = set()
+    # Three-part: catalog.schema.table -> key (schema, table)
+    for m in re.finditer(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b",
+        sql,
+    ):
+        key = (m.group(2).lower(), m.group(3).lower())
+        if key in table_map:
+            found.add(key)
+    # Two-part: schema.table -> key (schema, table)
+    for m in re.finditer(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b", sql
+    ):
+        key = (m.group(1).lower(), m.group(2).lower())
+        if key in table_map:
+            found.add(key)
+    # Bracket: [schema].[table]
+    for m in re.finditer(r"\[([^\]]+)\]\.\[([^\]]+)\]", sql, flags=re.IGNORECASE):
+        key = (m.group(1).strip().lower(), m.group(2).strip().lower())
+        if key in table_map:
+            found.add(key)
+    return found
+
+
 def _replace_column_refs(
     sql: str,
-    column_map: dict[tuple[str, str], str],
-    table_map: dict[str, tuple[str, str, str]],
+    column_map: dict[tuple[str, str, str], str],
+    table_map: dict[tuple[str, str], tuple[str, str, str]],
+    tables_in_sql: set[tuple[str, str]] | None = None,
 ) -> str:
     """
-    Replace column references: qualified (table.col -> table.target_col) and unqualified (col -> target_col).
-    Uses table_map to know which table names (source or target) to consider for qualification.
+    Replace column references: qualified (qualifier.col -> qualifier.target_col) and unqualified (col -> target_col).
+    Resolves qualifiers using SOURCE_SCHEMA, SOURCE_TABLE, and target names from table_map.
+    If tables_in_sql is provided, unqualified column replacement only uses mappings for those (schema, table) pairs,
+    so the same column name in different tables can map to different targets.
+    Column names that have no mapping are left unchanged (e.g. KEY_BILL_NUM_BILL_ITEM stays as-is if not in mapping).
     """
     result = sql
-    # Build set of source and target table names (lower) that participate in column mapping
-    table_names: set[str] = set()
-    for (tbl, _), _ in column_map.items():
-        table_names.add(tbl)
-        if tbl in table_map:
-            _, _, tgt_tbl = table_map[tbl]
-            table_names.add(tgt_tbl.lower())
+    if tables_in_sql is None:
+        tables_in_sql = set(table_map.keys())
+    # qualifier (lower) -> list of (schema, table) that use this qualifier (source schema, source table, or target catalog/schema/table)
+    qualifier_to_schema_table: dict[str, list[tuple[str, str]]] = {}
+    for (sch, tbl), (cat, tgt_sch, tgt_tbl) in table_map.items():
+        for q in (sch, tbl, cat.lower(), tgt_sch.lower(), tgt_tbl.lower()):
+            if q:
+                qualifier_to_schema_table.setdefault(q, []).append((sch, tbl))
 
-    # 1) Qualified: "table.col" or "alias.col" -> replace col when table/alias is in our set
+    # 1) Qualified: "qualifier.col" -> replace col when (schema, table, col) is in column_map; else leave as-is
     def qualified_repl(m: re.Match) -> str:
         qualifier = m.group(1)
         col = m.group(2)
         qual_lower = qualifier.lower()
         col_lower = col.lower()
-        for (tbl, src_col), tgt_col in column_map.items():
-            if src_col != col_lower:
-                continue
-            if qual_lower == tbl or (tbl in table_map and qual_lower == table_map[tbl][2].lower()):
-                return f"{qualifier}.{tgt_col}"
-        return m.group(0)
+        candidates = qualifier_to_schema_table.get(qual_lower, [])
+        for sch, tbl in candidates:
+            key = (sch, tbl, col_lower)
+            if key in column_map:
+                return f"{qualifier}.{column_map[key]}"
+        return m.group(0)  # no mapping: keep original column name
 
     result = re.sub(
         r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b",
@@ -367,22 +435,19 @@ def _replace_column_refs(
         result,
     )
 
-    # 2) Unqualified: whole-word column name. Replace only when it's a known source column.
+    # 2) Unqualified: only replace columns that have a mapping; unmapped column names are left as-is.
+    # Only use column mappings for (schema, table) that appear in this SQL (tables_in_sql).
+    # Include all mappings (even when target equals source) so that case normalization works (e.g. CONS_ATTRIBUTE -> cons_attribute).
     # Sort by length descending so longer names are replaced first (e.g. col_a before col)
-    replacements = []
-    for (tbl, src_col), tgt_col in column_map.items():
-        if src_col == tgt_col.lower():
+    replacements: list[tuple[str, str]] = []
+    seen_col: set[str] = set()
+    for (sch, tbl, src_col), tgt_col in column_map.items():
+        if (sch, tbl) not in tables_in_sql:
             continue
-        replacements.append((src_col, tgt_col))
-    # Dedupe by src_col (first target wins)
-    seen: set[str] = set()
-    unique_repl: list[tuple[str, str]] = []
-    for src, tgt in replacements:
-        if src not in seen:
-            seen.add(src)
-            unique_repl.append((src, tgt))
-    for src_col, tgt_col in sorted(unique_repl, key=lambda x: -len(x[0])):
-        # Word boundary: not inside another identifier
+        if src_col not in seen_col:
+            seen_col.add(src_col)
+            replacements.append((src_col, tgt_col))
+    for src_col, tgt_col in sorted(replacements, key=lambda x: -len(x[0])):
         pattern = r"\b" + re.escape(src_col) + r"\b"
         result = re.sub(pattern, lambda m: tgt_col, result, flags=re.IGNORECASE)
 
@@ -399,9 +464,10 @@ def map_sql(
     Map a source (Synapse) SQL statement to target (Databricks) using the mapping.
 
     Table references [schema].[table] or schema.table are replaced with
-    catalog.schema.table. Column names are replaced according to the mapping;
-    qualified column references (table.column) are updated when the table
-    is in the mapping.
+    catalog.schema.table. Column names that appear in the mapping are replaced;
+    column names with no mapping are left unchanged (e.g. KEY_BILL_NUM_BILL_ITEM
+    stays as-is if not in the mapping). Qualified column references (table.column)
+    are updated when the table is in the mapping.
 
     Args:
         sql: The source SQL statement to convert.
@@ -411,6 +477,7 @@ def map_sql(
     Returns:
         The SQL string with table and column names replaced.
     """
+    sql = html.unescape(sql)
     df = load_mapping(mapping, sheet_name=sheet_name)
 
     table_map = _build_table_map(df)
@@ -421,8 +488,9 @@ def map_sql(
 
     # Protect string literals from replacement (e.g. 'BILL_NUM || ...' in AS clauses)
     sql_work, literals = _mask_string_literals(sql)
+    tables_in_sql = _tables_in_sql(sql_work, table_map)
     result = _replace_table_refs(sql_work, table_map)
-    result = _replace_column_refs(result, column_map, table_map)
+    result = _replace_column_refs(result, column_map, table_map, tables_in_sql)
     return _unmask_string_literals(result, literals)
 
 

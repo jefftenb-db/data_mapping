@@ -1,15 +1,16 @@
 {
   "rules": [
     {
-      "find": "(NOBLOCK)",
-      "replace": ""
+      "find": "(?i)WITH\\s*\\(NOLOCK\\)",
+      "replace": "",
+      "regex": true
     },
     {
       "find": "ISNULL",
       "replace": "COALESCE"
     },
     {
-      "find": "TABLESAMPLE\\s*\\(\\s*(\\d+)\\s*PERCENTAGE\\s*\\)",
+      "find": "(?i)TABLESAMPLE\\s*\\(\\s*(\\d+)\\s*PERCENTAGE\\s*\\)",
       "replace": "TABLESAMPLE (\\1 PERCENT)",
       "regex": true
     }

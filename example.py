@@ -5,11 +5,11 @@ from sql_mapper import map_sql, load_mapping, process_input_file #, main
 # main()
 # Or with custom paths:
 process_input_file(
-    "mapping_input_sql.xlsx", #input file with sql statements and mapping id and dq test id
-    "mapping_master.xlsx", #mapping file with source and target names
-    "mapped_output.csv", #output file with mapped sql statements and mapping id and dq test id
-    "transpiler_input/mapped_output.sql", #output file with mapped sql statements, to be used in transpiler
-    syntax_rules_path="sql_syntax_rules.json", #optional syntax rules file
+    input_path="mapping_input_sql.xlsx", #input file with sql statements and mapping id and dq test id
+    mapping_path="mapping_master.xlsx", #mapping file with source and target names
+    output_csv_path="mapped_output.csv", #output file with mapped sql statements and mapping id and dq test id
+    output_sql_path="transpiler_input/mapped_output.sql", #output file with mapped sql statements, to be used in transpiler
+    syntax_rules_path="sql_syntax_rules.json" #optional syntax rules file
 )
 
 # Option 2: Map a single SQL statement with mapping file

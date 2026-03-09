@@ -38,6 +38,9 @@ TARGET_COLUMN = "TARGET_COLUMN"
 INPUT_MAPPING_ID = "MAPPING_ID"
 INPUT_DQ_TEST_ID = "DQ_TEST_ID"
 INPUT_SQL = "PRIMARY_SQL_QUERY"
+INPUT_SECONDARY_SQL = "SECONDARY_SQL_QUERY"
+# Literal in SECONDARY_SQL_QUERY that means "no secondary SQL"
+NULL_SECONDARY_MARKER = "[NULL]"
 
 # Keys for syntax rules file (JSON)
 RULES_KEY = "rules"
@@ -166,7 +169,8 @@ def load_input_sql(
         sheet_name: Sheet name to read.
 
     Returns:
-        DataFrame with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY.
+        DataFrame with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY,
+        and optionally SECONDARY_SQL_QUERY.
     """
     path = Path(source)
     if path.suffix.lower() not in (".xlsx", ".xls"):
@@ -177,6 +181,26 @@ def load_input_sql(
     if missing:
         raise ValueError(f"Input SQL file missing columns: {missing}")
     return df
+
+
+def _build_sql_from_input_row(row: pd.Series) -> str:
+    """
+    Build the full SQL string from a row: PRIMARY_SQL_QUERY, optionally
+    concatenated with SECONDARY_SQL_QUERY (ignored if missing or [NULL]).
+    Inserts /* BEGIN_SECONDARY_SQL */ between primary and secondary for later splitting.
+    """
+    primary = row[INPUT_SQL]
+    if pd.isna(primary):
+        primary = ""
+    else:
+        primary = str(primary).strip()
+    secondary_raw = row.get(INPUT_SECONDARY_SQL)
+    if secondary_raw is None or pd.isna(secondary_raw):
+        return primary
+    secondary = str(secondary_raw).strip()
+    if not secondary or secondary.upper() == NULL_SECONDARY_MARKER.upper():
+        return primary
+    return f"{primary} /* BEGIN_SECONDARY_SQL */ {secondary}"
 
 
 def _normalize_sql(sql: Any) -> str:
@@ -459,7 +483,8 @@ def process_input_file(
     Optionally applies syntax conversion rules from a JSON or YAML file (e.g. remove (NOBLOCK)).
 
     Args:
-        input_path: Path to Excel file with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY.
+        input_path: Path to Excel file with columns MAPPING_ID, DQ_TEST_ID, PRIMARY_SQL_QUERY,
+            and optionally SECONDARY_SQL_QUERY (concatenated after primary with /* BEGIN_SECONDARY_SQL */; use [NULL] to omit).
         mapping_path: Path to Excel mapping file with SOURCE_* and TARGET_* columns.
         output_csv_path: Path for CSV output (MAPPING_ID, DQ_TEST_ID, MAPPED_SQL).
         output_sql_path: Path for .sql output (one statement per line, each prefixed with /* MAPPING_ID,DQ_TEST_ID */ and ending with ;).
@@ -478,8 +503,8 @@ def process_input_file(
     for _, row in input_df.iterrows():
         mapping_id = row[INPUT_MAPPING_ID]
         dq_test_id = row[INPUT_DQ_TEST_ID]
-        sql = row[INPUT_SQL]
-        if pd.isna(sql) or str(sql).strip() == "":
+        sql = _build_sql_from_input_row(row)
+        if not sql:
             mapped = ""
         else:
             # Normalize to single line (collapse tabs, carriage returns, newlines)
